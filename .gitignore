@@ -1,0 +1,10 @@
+data/trip_status.csv
+data/arrivals.csv
+data/vehicle_steps.csv
+data/polls.csv
+data/segments.csv
+data/shapes.csv
+
+__pycache__/
+*.pyc
+.venv/
