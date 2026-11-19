@@ -8,3 +8,5 @@ data/shapes.csv
 __pycache__/
 *.pyc
 .venv/
+
+output/
