@@ -10,9 +10,16 @@ maximum likelihood, i.e. by counting and normalising, like the CPTs in class.
 Every predict_* function returns one predicted distribution over the 4 levels for each
 observed interval of a day. evaluate.py scores those predictions.
 
+Data: the sequences that data.py writes to output/ (run `python data.py` first), one
+integer per 5-minute interval, -1 = missing, for one of three observations:
+    level (core): excess wait, 0 shorter, 1 normal, 2 longer, 3 much longer
+    ratio, delay (ablations), see data.py
+The split into training and test days is done here (split_days), because it is part of
+the evaluation: every model, including the HMM, must learn from the training days only.
+
 Run this file on its own to print the learned tables:
     python baselines.py
-    python baselines.py --route mesa_loop
+    python baselines.py --route mesa_loop --obs ratio
 """
 
 import argparse
@@ -20,7 +27,39 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from load_data import K, LEVELS, ROUTES, hour_of_each_interval, load_route, split_days
+from data import OUT_DIR, STEP_MS, TZ, load_sequences
+
+ROUTES = ["inside_loop", "outside_loop", "mesa_loop"]
+OBSERVATIONS = ["level", "ratio", "delay"]
+LEVELS = ["level_0", "level_1", "level_2", "level_3"]  # names depend on the observation
+K = len(LEVELS)
+RES_DIR = OUT_DIR.parent / "results"
+
+
+# ---------------------------------------------------------------- data (read data.py's output)
+
+def load_route(name, obs="level"):
+    """{day: array of levels, -1 = missing} and {day: start time of step 0 in ms},
+    from output/<route>_<obs>.npz and output/<route>_<obs>_days.csv written by data.py."""
+    seqs = load_sequences(name, obs)
+    days = pd.read_csv(OUT_DIR / f"{name}_{obs}_days.csv")
+    starts = dict(zip(days["day"], days["start_ms"].astype("int64")))
+    return seqs, starts
+
+
+def split_days(seqs, n_test):
+    """Train on the earlier days and test on the last n_test days, so every model is
+    tested on days it has never seen."""
+    days = sorted(seqs)
+    if n_test >= len(days):
+        raise ValueError(f"only {len(days)} days, cannot hold out {n_test}")
+    return days[:-n_test], days[-n_test:]
+
+
+def hour_of_each_interval(day, n, starts):
+    """Local hour of day (0-23) of each of the n intervals of a day."""
+    t = pd.to_datetime(starts[day] + np.arange(n) * STEP_MS, unit="ms", utc=True)
+    return t.tz_convert(TZ).hour.to_numpy()
 
 
 # ---------------------------------------------------------------- 1. independent: P(o_t)
@@ -112,16 +151,16 @@ def fit_baselines(train, seqs, starts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--route", nargs="+", default=list(ROUTES))
+    ap.add_argument("--route", nargs="+", default=ROUTES)
     ap.add_argument("--test-days", type=int, default=4)
-    ap.add_argument("--source", choices=["intervals", "ratio"], default="intervals")
+    ap.add_argument("--obs", choices=OBSERVATIONS, default="level")
     args = ap.parse_args()
 
     for route in args.route:
-        seqs, starts = load_route(route, args.source)
+        seqs, starts = load_route(route, args.obs)
         train, _ = split_days(seqs, args.test_days)
         _, tables = fit_baselines(train, seqs, starts)
-        print(f"=== {route}, learned from {train[0]}..{train[-1]} ({len(train)} days)")
+        print(f"=== {route} ({args.obs}), learned from {train[0]}..{train[-1]} ({len(train)} days)")
         print("\nindependent: P(level)")
         print(pd.Series(tables["independent"], index=LEVELS).round(3).to_string())
         print("\nMarkov chain: P(next level | current level), rows = current level")

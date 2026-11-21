@@ -13,20 +13,20 @@ Models compared:
     independent, markov, time_of_day   the three baselines, from baselines.py
     the team's HMMs                    already trained, loaded from --hmm-dir (default ./hmms):
                                        one .npz per HMM with arrays pi, A, B, named
-                                       <route>_<name>.npz, e.g. outside_loop_hmm_3.npz
+                                       <route>_<obs>_<name>.npz, e.g. outside_loop_level_hmm_3.npz
                                        IMPORTANT: they must be trained on the training days only
-                                       (the same split as split_days), or the test is not fair
+                                       (use split_days from baselines.py), or the test is not fair
 This file does not train the HMM; it only scores it, with the forward algorithm.
 
 Outputs, in ./results:
-    results_<source>.csv               one row per route and model
-    test_loglik_<source>.png           test log-likelihood vs number of hidden states,
+    results_<obs>.csv                  one row per route and model
+    test_loglik_<obs>.png           test log-likelihood vs number of hidden states,
                                        with the baselines as horizontal lines
 
-Usage:
-    python evaluate.py                                  # all three loops, `level` observation
+Usage (run `python data.py` first, it writes the sequences to output/):
+    python evaluate.py                       # all three loops, `level` observation (core)
     python evaluate.py --route mesa_loop
-    python evaluate.py --source ratio --hmm-dir hmms_ratio   # ablation, after running data.py
+    python evaluate.py --obs ratio           # ablations: --obs ratio, --obs delay
 """
 
 import argparse
@@ -36,8 +36,7 @@ import pandas as pd
 
 from pathlib import Path
 
-from baselines import fit_baselines
-from load_data import K, RES_DIR, ROUTES, load_route, split_days
+from baselines import K, OBSERVATIONS, RES_DIR, ROUTES, fit_baselines, load_route, split_days
 
 
 def predict_hmm(pi, A, B, levels):
@@ -58,12 +57,13 @@ def predict_hmm(pi, A, B, levels):
     return np.array(preds).reshape(-1, K)
 
 
-def load_hmms(route, hmm_dir):
-    """{name: (pi, A, B)} for every <route>_<name>.npz in hmm_dir."""
+def load_hmms(route, obs, hmm_dir):
+    """{name: (pi, A, B)} for every <route>_<obs>_<name>.npz in hmm_dir."""
     hmms = {}
-    for f in sorted(Path(hmm_dir).glob(f"{route}_*.npz")):
+    prefix = f"{route}_{obs}_"
+    for f in sorted(Path(hmm_dir).glob(f"{prefix}*.npz")):
         p = np.load(f)
-        hmms[f.stem[len(route) + 1:]] = (p["pi"], p["A"], p["B"])
+        hmms[f.stem[len(prefix):]] = (p["pi"], p["A"], p["B"])
     return hmms
 
 
@@ -78,15 +78,15 @@ def score(predict, days, seqs):
     }
 
 
-def evaluate_route(route, source, n_test, hmm_dir):
-    seqs, starts = load_route(route, source)
+def evaluate_route(route, obs, n_test, hmm_dir):
+    seqs, starts = load_route(route, obs)
     train, test = split_days(seqs, n_test)
-    print(f"=== {route} ({source}): train {train[0]}..{train[-1]} ({len(train)} days), "
+    print(f"=== {route} ({obs}): train {train[0]}..{train[-1]} ({len(train)} days), "
           f"test {test[0]}..{test[-1]} ({len(test)} days)")
 
     # 1. the baselines learn from the training days only; the HMMs were trained the same way
     predictors, _ = fit_baselines(train, seqs, starts)
-    hmms = load_hmms(route, hmm_dir)
+    hmms = load_hmms(route, obs, hmm_dir)
     if not hmms:
         print(f"  (no HMMs found for {route} in {hmm_dir}/, scoring the baselines only)")
     n_states = {}
@@ -98,14 +98,14 @@ def evaluate_route(route, source, n_test, hmm_dir):
     rows = []
     for name, predict in predictors.items():
         tr, te = score(predict, train, seqs), score(predict, test, seqs)
-        rows.append({"route": route, "source": source, "model": name,
+        rows.append({"route": route, "obs": obs, "model": name,
                      "hidden_states": n_states.get(name),
                      "train_loglik": tr["loglik_per_interval"],
                      "test_loglik": te["loglik_per_interval"],
                      "test_accuracy": te["accuracy"],
                      "test_intervals": te["n_intervals"]})
     res = pd.DataFrame(rows)
-    print(res.drop(columns=["route", "source"]).to_string(index=False, float_format="%.3f"))
+    print(res.drop(columns=["route", "obs"]).to_string(index=False, float_format="%.3f"))
     print()
     return res
 
@@ -139,18 +139,18 @@ def plot(res, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--route", nargs="+", default=list(ROUTES))
-    ap.add_argument("--source", choices=["intervals", "ratio"], default="intervals")
+    ap.add_argument("--route", nargs="+", default=ROUTES)
+    ap.add_argument("--obs", choices=OBSERVATIONS, default="level")
     ap.add_argument("--test-days", type=int, default=4)
     ap.add_argument("--hmm-dir", default="hmms", help="folder with the trained HMMs (.npz)")
     args = ap.parse_args()
 
-    res = pd.concat([evaluate_route(r, args.source, args.test_days, args.hmm_dir)
+    res = pd.concat([evaluate_route(r, args.obs, args.test_days, args.hmm_dir)
                      for r in args.route])
     RES_DIR.mkdir(exist_ok=True)
-    res.to_csv(RES_DIR / f"results_{args.source}.csv", index=False)
-    print(f"results saved to {RES_DIR / f'results_{args.source}.csv'}")
-    plot(res, RES_DIR / f"test_loglik_{args.source}.png")
+    res.to_csv(RES_DIR / f"results_{args.obs}.csv", index=False)
+    print(f"results saved to {RES_DIR / f'results_{args.obs}.csv'}")
+    plot(res, RES_DIR / f"test_loglik_{args.obs}.png")
 
 
 if __name__ == "__main__":
