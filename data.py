@@ -1,4 +1,4 @@
-"""Build HMM observation sequences per route per service day
+"""Build HMM observation sequences per route per service day using stop_passages.csv and stop_times.csv
 
 For every stop, each gap between two consecutive buses is compared with the scheduled gap:
     r = actual gap / scheduled gap
@@ -10,43 +10,99 @@ and seperated into bins:
 
 Outputs, in ./output:
     <route>.npz            one integer array per service day, keyed "YYYY-MM-DD"
-    <route>_headways.csv   one row per gap, for checking and debugging
-    <route>_days.csv       one row per day: start time, steps, missing share, share of each bin
 
 All times are epoch milliseconds (integers) until they are printed
 """
 
 from pathlib import Path
 
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).parent / "data"
-ROUTES = {"UCSD_1040": "inside_loop", "UCSD_1030": "outside_loop", "UCSD_1050": "mesa_loop"}
-EXCLUDE_DAYS = {"2026-11-01", "2026-11-11"} # daylight savings & Veterans day
-STEP_MS = 5 * 60 * 1000 
-TZ = "America/Los_Angeles"
 OUT_DIR = Path(__file__).parent / "output"
+ROUTES = {"UCSD_1040": "inside_loop", "UCSD_1030": "outside_loop", "UCSD_1050": "mesa_loop"}
+STEP_MS = 5 * 60 * 1000
+TZ = "America/Los_Angeles"
+
+EXCLUDE_DAYS = {"2026-11-01", "2026-11-11"} # daylight savings & Veterans day
 
 def load(name):
+    """Read data/<name>.csv with ids read as text so they keep leading zeros"""
     ids = {c: str for c in ["trip_id", "stop_id", "route_id", "direction_id"]}
     return pd.read_csv(DATA_DIR / f"{name}.csv", dtype=ids)
 
-def service_day(service_date_ms):
-    """Turn service_date column (epoch ms) into 'YYYY-MM-DD' local dates."""
-    t = pd.to_datetime(service_date_ms + 12 * 3600 * 1000, unit="ms", utc=True)
+def local_day(ms):
+    """Epoch ms -> local date 'YYYY-MM-DD'"""
+    t = pd.to_datetime(ms, unit="ms", utc=True)
     return t.dt.tz_convert(TZ).dt.strftime("%Y-%m-%d")
 
-def clock(ms):
-    """Epoch ms -> HH:MM for printing"""
-    return pd.Timestamp(ms, unit="ms", tz="UTC").tz_convert(TZ).strftime("%H:%M")
+def last_stops(stop_times):
+    """Returns table with highest stop number (last stop) per trip_id and service_date"""
+    return (stop_times.groupby(["trip_id", "service_date"], as_index=False)["seq"]
+        .max().rename(columns={"seq": "last_seq"}))
 
-def keep_day(day):
-    if day in EXCLUDE_DAYS:
-        return False
-    if pd.Timestamp(day).dayofweek >= 5:
-        return False
-    return True
+def clean(table):
+    """Takes in scheduled or actual tables. Drop rows without a time, label the day, and drop excluded days"""
+    table = table.dropna(subset=["time"]).copy()
+
+    if table.empty:
+        return pd.DataFrame(columns=["day", "stop_id", "time"])
+    
+    table["time"] = table["time"].astype("int64")
+    table["day"] = local_day(table["time"])
+
+    weekday = pd.to_datetime(table["day"]).dt.dayofweek < 5
+    excluded = table["day"].isin(EXCLUDE_DAYS)
+    table = table[weekday & ~excluded]
+
+    return table[["day", "stop_id", "time"]]
+
+def scheduled_times(route_id, stop_times, ref_trips, last):
+    """Returns table when the route's buses are scheduled at each stop (leaving out last stop)"""
+    trips = set(ref_trips.loc[ref_trips["route_id"] == route_id, "trip_id"])
+
+    scheduled_table = stop_times[stop_times["trip_id"].isin(trips)].copy()
+    seconds = scheduled_table["arrival_time"].where(scheduled_table["seq"] != 0, scheduled_table["departure_time"]) # use departure_time at first stop instead of arrival_time
+    scheduled_table["time"] = scheduled_table["service_date"] + seconds * 1000
+
+    scheduled_table = scheduled_table.merge(last, on=["trip_id", "service_date"])
+    scheduled_table = scheduled_table[scheduled_table["seq"] < scheduled_table["last_seq"]]
+    return clean(scheduled_table)
+
+def actual_times(route_id, stop_passages, last):
+    """Returns table when the route's bus actually reached each stop (leaving out last stop)"""
+    actual_table = stop_passages[stop_passages["route_id"] == route_id].merge(last, on=["trip_id", "service_date"])
+
+    actual_table = actual_table[actual_table["seq"] < actual_table["last_seq"]].copy()
+    actual_table["time"] = actual_table["actual_time"]
+    return clean(actual_table)
+
+def times_by_stop(table, unique=False):
+    """Returns a dict {(day, stop_id): sorted list of times}
+    Ex: (2026-10-28 UCSD_11902): ['07:21', '07:40', '07:54', ...]"""
+    stops_dict = {}
+
+    for (day, stop), group in table.groupby(["day", "stop_id"]):
+        times = group["time"].tolist()
+        if unique:
+            times = set(times)
+        stops_dict[(day, stop)] = sorted(times)
+    return stops_dict
+
+def scheduled_gap(scheduled_times, t):
+    """The scheduled gap that time t falls in. A bus arriving after the last scheduled time
+    is compared with the day's last scheduled gap. None if there is no gap to compare with."""
+    if len(scheduled_times) < 2 or t <= scheduled_times[0]:
+        return None
+    
+    for before, after in zip(scheduled_times[:-1], scheduled_times[1:]):
+        if before < t <= after:
+            return after - before
+
+    return scheduled_times[-1] - scheduled_times[-2]
 
 def bin_ratio(r):
     """Actual gap / scheduled gap -> 0 short, 1 regular, 2 long, 3 very long."""
@@ -59,177 +115,86 @@ def bin_ratio(r):
     else:
         return 3
 
-
-def scheduled_gap(sched_times, t):
-    """The scheduled gap that time t falls in: walk through consecutive scheduled times
-    and return the length of the pair that t falls between.
-    A bus arriving after the last scheduled time (the day's last bus, running late) is
-    compared with the day's last scheduled gap. None if there is no gap to compare with."""
-    if len(sched_times) < 2 or t <= sched_times[0]:
-        return None
-    for before, after in zip(sched_times[:-1], sched_times[1:]):
-        if before < t <= after:
-            return after - before
-    return sched_times[-1] - sched_times[-2]
-
-
-def overlaps_gap(start, end, gaps):
-    """True if the interval [start, end] touches a collector outage (padded by one step)."""
-    for gap_start, gap_end in gaps:
-        if start < gap_end + STEP_MS and end > gap_start - STEP_MS:
-            return True
-    return False
-
-def route_tables(route_id, passages, stop_times, ref_trips):
-    """Two tables with columns day, stop_id, time (epoch ms): when buses were scheduled at
-    each stop, and when they actually came. Each trip's last stop is left out of both."""
-
-    trips = set(ref_trips.loc[ref_trips["route_id"] == route_id, "trip_id"])
-
-    sched = stop_times[stop_times["trip_id"].isin(trips)].copy()
-    seconds = sched["arrival_time"].where(sched["seq"] != 0, sched["departure_time"])
-    sched["time"] = sched["service_date"] + seconds * 1000
-
-    last = (sched.groupby(["trip_id", "service_date"], as_index=False)["seq"].max().rename(columns={"seq": "last_seq"}))
-    sched = sched.merge(last, on=["trip_id", "service_date"])
-    sched = sched[sched["seq"] < sched["last_seq"]]
-
-    actual = passages[passages["route_id"] == route_id].merge(last, on=["trip_id", "service_date"])
-    actual = actual[actual["seq"] < actual["last_seq"]].copy()
-    actual["time"] = actual["actual_time"]
-
-    tables = []
-    for table in (sched, actual):
-        table = table.dropna(subset=["time"]).copy()
-        if table.empty:
-            tables.append(pd.DataFrame(columns=["day", "stop_id", "trip_id", "time"]))
-            continue
-        table["time"] = table["time"].astype("int64")
-        table["day"] = service_day(table["service_date"])
-        table = table[table["day"].map(keep_day)]
-        tables.append(table[["day", "stop_id", "trip_id", "time"]])
-    return tables[0], tables[1]
-
-
-def times_by_stop(table, unique=False):
-    out = {}
-    for (day, stop), group in table.groupby(["day", "stop_id"]):
-        times = group["time"].tolist()
-        if unique:
-            times = set(times)
-        out[(day, stop)] = sorted(times)
-    return out
-
-def headways(actual_by_stop, sched_by_stop, gaps):
-    rows = []
+def headways(actual_by_stop, sched_by_stop):
+    """Returns dict {day: list of (time the gap ended, bin)}, from every stop of the route."""
+    gaps_by_day = defaultdict(list)
     skipped = 0
+
     for (day, stop), arrivals in actual_by_stop.items():
         sched = sched_by_stop.get((day, stop), [])
+
         for prev, cur in zip(arrivals[:-1], arrivals[1:]):
             H = scheduled_gap(sched, cur)
-            if H is None or overlaps_gap(prev, cur, gaps):
+            if H is None:
                 skipped += 1
                 continue
-            r = (cur - prev) / H
-            rows.append({"day": day, "stop_id": stop, "prev": prev, "cur": cur,
-                         "h_min": round((cur - prev) / 60000, 2), "H_min": round(H / 60000, 2),
-                         "r": round(r, 3), "bin": bin_ratio(r)})
-    columns = ["day", "stop_id", "prev", "cur", "h_min", "H_min", "r", "bin"]
-    return pd.DataFrame(rows, columns=columns), skipped
+            gaps_by_day[day].append((cur, bin_ratio((cur - prev) / H)))
 
+    return gaps_by_day, skipped
 
-def day_sequence(day_headways, first_time, last_time, gaps):
-    start = first_time // STEP_MS * STEP_MS
+def day_sequence(day_gaps, first_time, last_time):
+    """The day's observation array, and the time its step 0 starts.
+    Step t covers [start + t * 5 min, start + (t + 1) * 5 min)."""
+    start = first_time // STEP_MS * STEP_MS # round down to a 5-minute mark
     n_steps = (last_time - start) // STEP_MS + 1
-    obs = np.full(n_steps, -1)         
 
-    for cur, b in zip(day_headways["cur"], day_headways["bin"]):
+    obs = np.full(n_steps, -1)
+    for cur, b in day_gaps:
         t = (cur - start) // STEP_MS
         obs[t] = max(obs[t], b)
-
-    for t in range(n_steps):
-        step_start = start + t * STEP_MS
-        if overlaps_gap(step_start, step_start + STEP_MS, gaps):
-            obs[t] = -1
+    
     return obs, start
 
+def build_route(route_id, stop_passages, stop_times, ref_trips, last):
+    """Returns {day: observation array} and {day: start time} for one route."""
+    scheduled_table = scheduled_times(route_id, stop_times, ref_trips, last)
+    actual_table = actual_times(route_id, stop_passages, last)
 
-def build_route(route_id, passages, stop_times, ref_trips, gaps):
-    sched, actual = route_tables(route_id, passages, stop_times, ref_trips)
-    hw, skipped = headways(times_by_stop(actual), times_by_stop(sched, unique=True), gaps)
+    actual_by_stop = times_by_stop(actual_table)
+    scheduled_by_stop = times_by_stop(scheduled_table, unique=True)
+    gaps_by_day, skipped = headways(actual_by_stop, scheduled_by_stop)
 
-    seqs, summary = {}, []
-    hw["step"] = -1
-    for day in sorted(sched["day"].unique()):
-        day_sched = sched[sched["day"] == day]
-        day_actual = actual[actual["day"] == day]
-        day_hw = hw[hw["day"] == day]
-        first = day_sched["time"].min()
-        last = max(day_sched["time"].max(), day_actual["time"].max() if len(day_actual) else 0)
+    seqs, starts = {}, {}
+    for day in sorted(scheduled_table["day"].unique()):
+        day_gaps = gaps_by_day[day]
+        day_schedule = scheduled_table.loc[scheduled_table["day"] == day, "time"]
 
-        obs, start = day_sequence(day_hw, first, last, gaps)
-        seqs[day] = obs
-        hw.loc[hw["day"] == day, "step"] = (day_hw["cur"] - start) // STEP_MS
+        first = day_schedule.min()
+        last_time = max([day_schedule.max()] + [cur for cur, _ in day_gaps])
 
-        row = {"day": day, "start": clock(start), "start_ms": start, "steps": len(obs),
-               "missing": round(float(np.mean(obs == -1)), 3), "headways": len(day_hw)}
-        for b, name in enumerate(["short", "regular", "long", "very_long"]):
-            row[name] = round(float(np.mean(obs == b)), 3)
-        summary.append(row)
-    return seqs, hw, pd.DataFrame(summary), skipped
+        seqs[day], starts[day] = day_sequence(day_gaps, first, last_time)
+    return seqs, starts, skipped
 
-
-def check_schedule_formula(passages, stop_times):
-    st = stop_times.copy()
-    seconds = st["arrival_time"].where(st["seq"] != 0, st["departure_time"])
-    st["time"] = st["service_date"] + seconds * 1000
-    m = st.merge(passages, on=["trip_id", "service_date", "seq"])
-    m = m[~service_day(m["service_date"]).isin(EXCLUDE_DAYS)]
-    print(f"Schedule formula check: {(m['time'] == m['scheduled_time']).mean():.2%} of "
-          f"{len(m):,} rows match")
-
-
-def print_sequence(name, day, from_clock="00:00", n=12):
-    seqs = np.load(OUT_DIR / f"{name}.npz")
-    days = pd.read_csv(OUT_DIR / f"{name}_days.csv").set_index("day")
-    if day not in seqs:
-        print(f"{name} {day}: not in the data")
-        return
-    obs, start = seqs[day], int(days.loc[day, "start_ms"])
-    times = [clock(start + t * STEP_MS) for t in range(len(obs))]
+def show(obs, start, from_clock="7:00", n=12):
+    """Print n steps of a sequence with their clock times above them."""
+    times = [pd.Timestamp(start + t * STEP_MS, unit="ms", tz="UTC").tz_convert(TZ).strftime("%H:%M")
+        for t in range(len(obs))]
     first = next((t for t, c in enumerate(times) if c >= from_clock), 0)
-    print(f"{name} {day}:")
+
     print("  " + "  ".join(times[first:first + n]))
     print("  " + "  ".join(f"{v:>5}" for v in obs[first:first + n]))
-
-
+    
+    
 def main():
-    passages = load("stop_passages")
+    stop_passages = load("stop_passages")
     stop_times = load("stop_times")
-    ref_trips = load("ref_trips").drop_duplicates("trip_id")
+    ref_trips = load("ref_trips")
+    assert len(load("gaps")) == 0
 
-    gaps = []
-    if (DATA_DIR / "gaps.csv").exists():
-        g = load("gaps")
-        gaps = list(zip(g["start_ms"], g["end_ms"]))
-
-    check_schedule_formula(passages, stop_times)
     OUT_DIR.mkdir(exist_ok=True)
 
+    last = last_stops(stop_times)
     for route_id, name in ROUTES.items():
-        seqs, hw, summary, skipped = build_route(route_id, passages, stop_times, ref_trips, gaps)
-
+        seqs, starts, skipped = build_route(route_id, stop_passages, stop_times, ref_trips, last)
+        
         np.savez(OUT_DIR / f"{name}.npz", **seqs)
-        hw.to_csv(OUT_DIR / f"{name}_headways.csv", index=False)
-        summary.to_csv(OUT_DIR / f"{name}_days.csv", index=False)
-        print(f"\n{name}: {len(seqs)} days, {len(hw):,} headways ({skipped:,} skipped), "
-              f"{(hw['bin'] == 1).mean():.1%} regular")
-        print(summary.drop(columns="start_ms").to_string(index=False))
+        print(f"{name}: {len(seqs)} days saved, {skipped} gaps skipped")
 
-    print()
-    print_sequence("outside_loop", "2026-11-02", "12:05")
-    print_sequence("outside_loop", "2026-10-28", "16:00")
-
+        # if name == "outside_loop":
+        #     for day, clock_from in [("2026-11-02", "7:15")]:
+        #         if day in seqs:
+        #             print(f"  {day} from {clock_from}:")
+        #             show(seqs[day], starts[day], clock_from)
 
 if __name__ == "__main__":
     main()
