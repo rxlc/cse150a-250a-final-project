@@ -16,7 +16,6 @@ NAMES = {"inside_loop": "Inside Loop", "outside_loop": "Outside Loop", "mesa_loo
 ROUTE_COLORS = {"inside_loop": "#c49112", "outside_loop": "#03629C", "mesa_loop": "#1baf7a"}
 CUTS = [-60, 120, 300]
 
-
 def main(lo=-300, hi=720, width=30):
     iv = load("intervals_5min").dropna(subset=["level", "excess_wait_s"]).copy()
     iv["day"] = local_day(iv["slot_start"])
