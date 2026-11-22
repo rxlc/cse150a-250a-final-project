@@ -1,4 +1,5 @@
-"""Build HMM observation sequences per route per weekday, for three observations:
+"""
+Build HMM observation sequences per route per weekday, for three observations:
 
   level  (core)       excess rider wait from the collector's intervals_5min.csv, binned
                       0 shorter, 1 normal, 2 longer, 3 much longer
