@@ -22,9 +22,12 @@ observation's HMM only with the baselines on the same observation.
 Models compared:
     independent, markov, time_of_day   the three baselines, from baselines.py (fitted here by
                                        counting on the training days)
-    hmm                                the model that hmm_train.py saved in
-                                       output/<route>_<obs>_hmm.npz (trained without the test
-                                       days); this file does not train the HMM
+    hmm_K3                             the main HMM (config.K = 3 states) that hmm_train.py saved
+                                       in output/<route>_<obs>_K3_hmm.npz (trained without the
+                                       test days); this file does not train the HMM
+    hmm_K2, hmm_K4, ...                with --k-ablation: an HMM for every K in config.K_CANDIDATES,
+                                       all reported on the test days. This is an ablation, not a
+                                       choice: the main model stays K = 3 whatever these scores are
 
 Outputs, in ./results:
     results_<obs>.csv                  one row per route and model, all test days together
@@ -33,6 +36,7 @@ Outputs, in ./results:
 Usage (run `python data.py`, then `python hmm_train.py --obs ...` first):
     python evaluate.py                       # core observation, all three loops
     python evaluate.py --obs ratio           # ablations: --obs ratio, --obs delay
+    python evaluate.py --k-ablation          # K = 2, 3, 4 (run hmm_train.py --k-ablation first)
     python evaluate.py --route mesa_loop
 """
 
@@ -42,7 +46,7 @@ import numpy as np
 import pandas as pd
 
 from baselines import fit_baselines
-from config import OBSERVATIONS, STEPS_AHEAD
+from config import K, K_CANDIDATES, OBSERVATIONS, STEPS_AHEAD
 from data import OUT_DIR, ROUTES, load_route, split_days
 from hmm import forecasts
 
@@ -108,19 +112,21 @@ def predict_hmm(pi, A, B, levels, k):
     return preds
 
 
-def load_hmm(route, obs, train, test):
-    """predict(day, levels, k) for the HMM in output/<route>_<obs>_hmm.npz. Checks it was
-    trained on the current training days and not on the test days, so a stale file is not used."""
-    saved = np.load(OUT_DIR / f"{route}_{obs}_hmm.npz")
+def load_hmm(route, obs, n_states, train, test):
+    """predict(day, levels, k) for the HMM with n_states hidden states in
+    output/<route>_<obs>_K<n_states>_hmm.npz. Checks it was trained on the current training
+    days and not on the test days, so a stale file is not used."""
+    path = OUT_DIR / f"{route}_{obs}_K{n_states}_hmm.npz"
+    saved = np.load(path)
     if ("train_days" not in saved or list(saved["train_days"]) != list(train)
             or list(saved["test_days"]) != list(test)):
-        raise RuntimeError(f"{route}_{obs}_hmm.npz was not trained on the current training days; "
+        raise RuntimeError(f"{path.name} was not trained on the current training days; "
                            f"rerun hmm_train.py --obs {obs}")
     pi, A, B = saved["pi"], saved["A"], saved["B"]
     return lambda day, levels, k: predict_hmm(pi, A, B, levels, k)
 
 
-def evaluate_route(route, obs):
+def evaluate_route(route, obs, all_states):
     M, _ = OBSERVATIONS[obs]
     seqs, starts = load_route(route, obs)
 
@@ -129,7 +135,8 @@ def evaluate_route(route, obs):
 
     # 1. every model comes from the training days only
     predictors, _ = fit_baselines(train, seqs, starts, M)
-    predictors["hmm"] = load_hmm(route, obs, train, test)
+    for n_states in all_states:
+        predictors[f"hmm_K{n_states}"] = load_hmm(route, obs, n_states, train, test)
 
     # 2. every model is scored the same way: on all test days together, and on each test day
     rows, day_rows = [], []
@@ -142,16 +149,18 @@ def evaluate_route(route, obs):
     res, by_day = pd.DataFrame(rows), pd.DataFrame(day_rows)
     print(res.drop(columns=["route", "obs"]).to_string(index=False, float_format="%.4f"))
 
-    # per test day: the HMM next to the Markov chain, and on how many days the HMM was better
+    # per test day: each HMM next to the Markov chain, and on how many days the HMM was better
     cols = ["loglik_per_interval"] + [f"brier_k{k}" for k in STEPS_AHEAD]
-    hmm_d = by_day[by_day["model"] == "hmm"].set_index("day")[cols]
     markov_d = by_day[by_day["model"] == "markov"].set_index("day")[cols]
-    print("\nper test day (log-lik: higher is better, Brier: lower is better)")
-    print(pd.concat({"hmm": hmm_d, "markov": markov_d}, axis=1).to_string(float_format="%.4f"))
-    wins = [f"log-lik {(hmm_d['loglik_per_interval'] > markov_d['loglik_per_interval']).sum()}"]
-    for k in STEPS_AHEAD:
-        wins.append(f"Brier k={k} {(hmm_d[f'brier_k{k}'] < markov_d[f'brier_k{k}']).sum()}")
-    print(f"days (of {len(test)}) the HMM beat the Markov chain: " + ", ".join(wins))
+    for n_states in all_states:
+        name = f"hmm_K{n_states}"
+        hmm_d = by_day[by_day["model"] == name].set_index("day")[cols]
+        print(f"\nper test day, {name} vs markov (log-lik: higher is better, Brier: lower is better)")
+        print(pd.concat({name: hmm_d, "markov": markov_d}, axis=1).to_string(float_format="%.4f"))
+        wins = [f"log-lik {(hmm_d['loglik_per_interval'] > markov_d['loglik_per_interval']).sum()}"]
+        for k in STEPS_AHEAD:
+            wins.append(f"Brier k={k} {(hmm_d[f'brier_k{k}'] < markov_d[f'brier_k{k}']).sum()}")
+        print(f"days (of {len(test)}) {name} beat the Markov chain: " + ", ".join(wins))
     print()
     return res, by_day
 
@@ -160,9 +169,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--route", nargs="+", default=list(ROUTES.values()))
     ap.add_argument("--obs", choices=list(OBSERVATIONS), default="level")
+    ap.add_argument("--k-ablation", action="store_true", help="also score every K in config.K_CANDIDATES")
     args = ap.parse_args()
+    all_states = K_CANDIDATES if args.k_ablation else [K]
 
-    results = [evaluate_route(r, args.obs) for r in args.route]
+    results = [evaluate_route(r, args.obs, all_states) for r in args.route]
     RES_DIR.mkdir(exist_ok=True)
     pd.concat([res for res, _ in results]).to_csv(RES_DIR / f"results_{args.obs}.csv", index=False)
     pd.concat([by_day for _, by_day in results]).to_csv(RES_DIR / f"results_{args.obs}_by_day.csv", index=False)
