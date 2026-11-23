@@ -114,11 +114,11 @@ def fit_once(days, K, M, rng, pseudo, max_iters, tol):
     return pi, A, B, log_p, objectives
 
 def sort_states(pi, A, B):
-    """Order states by expected level sum_k k * b_ik, so state 0 is calmest and state K-1 the most disrupted"""
+    """Sort states by expected level sum_k k * b_ik, so state 0 is calmest and state K-1 the most disrupted"""
     order = np.argsort(B @ np.arange(B.shape[1]))
     return pi[order], A[order][:, order], B[order]
 
-def baum_welch(days, K=3, M=4, restarts=10, pseudo=0.1, max_iters=500, tol=1e-6, seed=0):
+def baum_welch(days, K=3, M=4, restarts=10, pseudo=0.1, max_iters=500, tol=1e-6, seed=11):
     """Best of several EM runs from random starts. Returns pi, A, B (states sorted) and log P of the training days"""
     rng = np.random.default_rng(seed)
     best = None
@@ -132,3 +132,48 @@ def baum_welch(days, K=3, M=4, restarts=10, pseudo=0.1, max_iters=500, tol=1e-6,
     pi, A, B, log_p = best
     pi, A, B = sort_states(pi, A, B)
     return pi, A, B, log_p
+
+def filter_beliefs(pi, A, B, observations):
+    """Detection: P(S_t = i | o_1:t) for every t from the forward pass"""
+    log_alpha = forward(pi, A, B, observations)
+    beliefs = np.zeros_like(log_alpha)
+
+    for t in range(len(observations)):
+        beliefs[t] = np.exp(log_alpha[t] - logsumexp(log_alpha[t]))
+    return beliefs
+
+def predict(belief, A, B, k):
+    """Prediction k steps ahead: P(S_t+k | o_1:t) and P(O_t+k | o_1:t)"""
+    state_dist = belief @ np.linalg.matrix_power(A, k)
+    obs_dist = state_dist @ B
+
+    return state_dist, obs_dist
+
+def forecasts(pi, A, B, observations, k):
+    """For every t, the predicted distribution of o_t+k made at time t. Row t forecasts observations[t + k]"""
+    beliefs = filter_beliefs(pi, A, B, observations)
+    Ak_B = np.linalg.matrix_power(A, k) @ B
+
+    return beliefs[: len(observations) - k] @ Ak_B
+
+def viterbi(pi, A, B, observations):
+    """Most likely hidden state sequence s_1:T given o_1:T, in log space (described in words in section 3.3)."""
+    T, K = len(observations), len(pi)
+    log_delta = np.zeros((T, K))
+
+    backpointers_m = np.zeros((T, K), dtype=int)
+    log_delta[0] = np.log(pi) + np.log(emission(B, observations[0]))
+    for t in range(1, T):
+        e = np.log(emission(B, observations[t]))
+        
+        for j in range(K):
+            scores = log_delta[t - 1] + np.log(A[:, j])
+            backpointers_m[t, j] = np.argmax(scores)
+            log_delta[t, j] = scores[back[t, j]] + e[j]
+
+    path = np.zeros(T, dtype=int)
+    path[-1] = np.argmax(log_delta[-1])
+    for t in range(T - 1, 0, -1):
+        path[t - 1] = backpointers_m[t, path[t]]
+
+    return path, log_delta[-1].max()

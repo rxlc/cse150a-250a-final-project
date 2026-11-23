@@ -1,15 +1,15 @@
 """Fit one HMM per route on all weekdays and save the learned tables"""
- 
+
 import numpy as np
  
-from data import OUT_DIR, ROUTES, load_sequences
+from data import OUT_DIR, ROUTES, load_sequences, merge_0_1_levels
 from hmm import baum_welch
  
 np.set_printoptions(precision=3, suppress=True)
 
 def main():
     for name in ROUTES.values():
-        days = list(load_sequences(name, "level").values())
+        days = [merge_0_1_levels(o) for o in load_sequences(name, "level").values()]
         print(f"{name}: {len(days)} days")
         pi, A, B, log_p = baum_welch(days)
         np.savez(OUT_DIR / f"{name}_hmm.npz", pi=pi, A=A, B=B, log_p=log_p)

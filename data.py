@@ -241,6 +241,9 @@ def print_sequence(name, day, from_clock="00:00", n=12, obs_name="level"):
     print("  " + "  ".join(times[first:first + n]))
     print("  " + "  ".join(f"{v:>5}" for v in obs[first:first + n]))
 
+def merge_0_1_levels(o):
+    return np.where(o < 0, -1, np.maximum(o, 1) - 1)
+
 def main():
     stop_passages = load("stop_passages")
     stop_times = load("stop_times")
