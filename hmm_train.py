@@ -12,6 +12,7 @@ on the test days. The main model stays K = 3 whatever those scores are.
     python hmm_train.py                       # core observation (excess wait level), K = 3
     python hmm_train.py --k-ablation          # K = 2, 3, 4
     python hmm_train.py --obs ratio           # ablations: --obs ratio, --obs delay
+    python hmm_train.py --route mesa_loop     # one route only (run routes in parallel to save time)
 """
 
 import argparse
@@ -26,13 +27,14 @@ np.set_printoptions(precision=3, suppress=True)
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--route", nargs="+", default=list(ROUTES.values()))
     ap.add_argument("--obs", choices=list(OBSERVATIONS), default="level")
     ap.add_argument("--k-ablation", action="store_true", help="train every K in config.K_CANDIDATES")
     args = ap.parse_args()
     M, _ = OBSERVATIONS[args.obs]
     all_states = K_CANDIDATES if args.k_ablation else [K]
 
-    for name in ROUTES.values():
+    for name in args.route:
         seqs, _ = load_route(name, args.obs)
         train, test = split_days(seqs)
         days = [seqs[d] for d in train]
