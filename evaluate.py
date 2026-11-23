@@ -1,32 +1,39 @@
 """Evaluation: is the HMM better than the baselines?
 
-Every model learns from the training days only, then predicts the held-out test days one
-5-minute interval at a time, and every model is scored the same way on those test days:
+Every model learns from the training days only (all days except config.TEST_DAYS, the same
+for all models), then predicts the held-out test days, and every model is scored by score() below.
 
-    test log-likelihood per interval   mean of log P(level that really happened | model)
+Every model gives, for one day and a number of steps ahead k, a (T, M) array `preds`:
+    preds[t] = P(o_t | o_0 .. o_{t-k})     predicted distribution of the level at step t,
+                                           made k steps (k * 5 minutes) earlier
+With k = 1 this is the usual one-step prediction used for the log-likelihood.
+
+    test log-likelihood per interval   mean of log P(level that really happened | levels seen so far)
                                        closer to 0 = the model predicted the real data better
                                        (this is the main score)
-    accuracy                           how often the model's top guess was right; misleading
-                                       here, since most intervals are "normal"
+    Brier score at k = 1, 2, 6         sum over levels of (predicted p - 1 if it happened else 0)^2,
+                                       for the prediction made k steps (5, 10, 30 min) earlier;
+                                       0 is perfect, lower is better
+
+Accuracy is not reported: most intervals are "normal", so always guessing "normal" scores well.
+Scores of different observations (--obs) are not comparable with each other: compare each
+observation's HMM only with the baselines on the same observation.
 
 Models compared:
-    independent, markov, time_of_day   the three baselines, from baselines.py
-    the team's HMMs                    already trained, loaded from --hmm-dir (default ./hmms):
-                                       one .npz per HMM with arrays pi, A, B, named
-                                       <route>_<obs>_<name>.npz, e.g. outside_loop_level_hmm_3.npz
-                                       IMPORTANT: they must be trained on the training days only
-                                       (use split_days from baselines.py), or the test is not fair
-This file does not train the HMM; it only scores it, with the forward algorithm.
+    independent, markov, time_of_day   the three baselines, from baselines.py (fitted here by
+                                       counting on the training days)
+    hmm                                the model that hmm_train.py saved in
+                                       output/<route>_<obs>_hmm.npz (trained without the test
+                                       days); this file does not train the HMM
 
 Outputs, in ./results:
-    results_<obs>.csv                  one row per route and model
-    test_loglik_<obs>.png           test log-likelihood vs number of hidden states,
-                                       with the baselines as horizontal lines
+    results_<obs>.csv                  one row per route and model, all test days together
+    results_<obs>_by_day.csv           one row per route, model and test day
 
-Usage (run `python data.py` first, it writes the sequences to output/):
-    python evaluate.py                       # all three loops, `level` observation (core)
-    python evaluate.py --route mesa_loop
+Usage (run `python data.py`, then `python hmm_train.py --obs ...` first):
+    python evaluate.py                       # core observation, all three loops
     python evaluate.py --obs ratio           # ablations: --obs ratio, --obs delay
+    python evaluate.py --route mesa_loop
 """
 
 import argparse
@@ -34,123 +41,132 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from pathlib import Path
+from baselines import fit_baselines
+from config import OBSERVATIONS, STEPS_AHEAD
+from data import OUT_DIR, ROUTES, load_route, split_days
+from hmm import forecasts
 
-from baselines import K, OBSERVATIONS, RES_DIR, ROUTES, fit_baselines, load_route, split_days
+RES_DIR = OUT_DIR.parent / "results"
 
 
-def predict_hmm(pi, A, B, levels):
-    """Forward algorithm, run as a prediction. Keeps a belief
-    P(hidden state now | levels seen so far today), and for each observed interval returns
-    P(level | levels seen so far) = belief @ B. Then it updates the belief with the level
-    that really happened (Bayes' rule) and moves it one step forward through A.
-    A missing interval (-1) gives no evidence, but the 5 minutes still pass.
-    Normalising the belief every step keeps the numbers from underflowing on long days."""
-    belief = pi.copy()
-    preds = []
-    for o in levels:
+# ---------------------------------------------------------------- metrics, the same for every model
+
+def log_lik(preds, levels):
+    """Sum of log P(observed level) over the observed steps, and how many there were.
+    preds must be the k = 1 predictions."""
+    total, n = 0.0, 0
+    for t, o in enumerate(levels):
         if o >= 0:
-            preds.append(belief @ B)          # predict, before seeing o
-            belief = belief * B[:, o]         # update with what happened
-            belief /= belief.sum()
-        belief = belief @ A                   # 5 minutes pass
-    return np.array(preds).reshape(-1, K)
+            total += np.log(preds[t, o])
+            n += 1
+    return total, n
 
 
-def load_hmms(route, obs, hmm_dir):
-    """{name: (pi, A, B)} for every <route>_<obs>_<name>.npz in hmm_dir."""
-    hmms = {}
-    prefix = f"{route}_{obs}_"
-    for f in sorted(Path(hmm_dir).glob(f"{prefix}*.npz")):
-        p = np.load(f)
-        hmms[f.stem[len(prefix):]] = (p["pi"], p["A"], p["B"])
-    return hmms
+def brier(preds, levels, k):
+    """Sum of Brier scores, sum over levels of (p_m - [o_t = m])^2, over the observed steps
+    t >= k (steps that have k earlier steps to predict from), and how many there were."""
+    total, n = 0.0, 0
+    for t in range(k, len(levels)):
+        o = levels[t]
+        if o >= 0:
+            truth = np.zeros(preds.shape[1])
+            truth[o] = 1
+            total += np.sum((preds[t] - truth) ** 2)
+            n += 1
+    return total, n
 
 
 def score(predict, days, seqs):
-    """Run one model over a set of days and grade its predictions."""
-    P = np.vstack([predict(day, seqs[day]) for day in days])
-    y = np.concatenate([seqs[day][seqs[day] >= 0] for day in days])
-    return {
-        "loglik_per_interval": np.mean(np.log(P[np.arange(len(y)), y])),
-        "accuracy": np.mean(P.argmax(axis=1) == y),
-        "n_intervals": len(y),
-    }
+    """Score one model on a set of days. predict(day, levels, k) -> (T, M) array as above.
+    Returns log-likelihood per observed interval and the mean Brier score at each k."""
+    ll, n_ll = 0.0, 0
+    br = {k: [0.0, 0] for k in STEPS_AHEAD}
+    for day in days:
+        levels = seqs[day]
+        s, n = log_lik(predict(day, levels, 1), levels)
+        ll, n_ll = ll + s, n_ll + n
+        for k in STEPS_AHEAD:
+            s, n = brier(predict(day, levels, k), levels, k)
+            br[k][0] += s
+            br[k][1] += n
+    result = {"loglik_per_interval": ll / n_ll, "n_intervals": n_ll}
+    for k in STEPS_AHEAD:
+        result[f"brier_k{k}"] = br[k][0] / br[k][1]
+    return result
 
 
-def evaluate_route(route, obs, n_test, hmm_dir):
+# ---------------------------------------------------------------- the HMM, as a predictor
+
+def predict_hmm(pi, A, B, levels, k):
+    """Same interface as the baselines: row t = P(o_t | o_0 .. o_{t-k}).
+    For t >= k this is hmm.forecasts (filtered belief at t - k, moved k steps through A, then B).
+    For t < k nothing has been seen yet, so it is pi moved t steps through A, then B."""
+    preds = np.zeros((len(levels), B.shape[1]))
+    for t in range(min(k, len(levels))):
+        preds[t] = pi @ np.linalg.matrix_power(A, t) @ B
+    preds[k:] = forecasts(pi, A, B, levels, k)
+    return preds
+
+
+def load_hmm(route, obs, train, test):
+    """predict(day, levels, k) for the HMM in output/<route>_<obs>_hmm.npz. Checks it was
+    trained on the current training days and not on the test days, so a stale file is not used."""
+    saved = np.load(OUT_DIR / f"{route}_{obs}_hmm.npz")
+    if ("train_days" not in saved or list(saved["train_days"]) != list(train)
+            or list(saved["test_days"]) != list(test)):
+        raise RuntimeError(f"{route}_{obs}_hmm.npz was not trained on the current training days; "
+                           f"rerun hmm_train.py --obs {obs}")
+    pi, A, B = saved["pi"], saved["A"], saved["B"]
+    return lambda day, levels, k: predict_hmm(pi, A, B, levels, k)
+
+
+def evaluate_route(route, obs):
+    M, _ = OBSERVATIONS[obs]
     seqs, starts = load_route(route, obs)
-    train, test = split_days(seqs, n_test)
-    print(f"=== {route} ({obs}): train {train[0]}..{train[-1]} ({len(train)} days), "
-          f"test {test[0]}..{test[-1]} ({len(test)} days)")
 
-    # 1. the baselines learn from the training days only; the HMMs were trained the same way
-    predictors, _ = fit_baselines(train, seqs, starts)
-    hmms = load_hmms(route, obs, hmm_dir)
-    if not hmms:
-        print(f"  (no HMMs found for {route} in {hmm_dir}/, scoring the baselines only)")
-    n_states = {}
-    for name, (pi, A, B) in hmms.items():
-        predictors[name] = lambda day, levels, pi=pi, A=A, B=B: predict_hmm(pi, A, B, levels)
-        n_states[name] = len(pi)
+    train, test = split_days(seqs)
+    print(f"=== {route} ({obs}, M = {M}): train {len(train)} days, test {', '.join(test)}")
 
-    # 2. every model is scored the same way, on the training days and on the test days
-    rows = []
+    # 1. every model comes from the training days only
+    predictors, _ = fit_baselines(train, seqs, starts, M)
+    predictors["hmm"] = load_hmm(route, obs, train, test)
+
+    # 2. every model is scored the same way: on all test days together, and on each test day
+    rows, day_rows = [], []
     for name, predict in predictors.items():
-        tr, te = score(predict, train, seqs), score(predict, test, seqs)
-        rows.append({"route": route, "obs": obs, "model": name,
-                     "hidden_states": n_states.get(name),
-                     "train_loglik": tr["loglik_per_interval"],
-                     "test_loglik": te["loglik_per_interval"],
-                     "test_accuracy": te["accuracy"],
-                     "test_intervals": te["n_intervals"]})
-    res = pd.DataFrame(rows)
-    print(res.drop(columns=["route", "obs"]).to_string(index=False, float_format="%.3f"))
+        rows.append({"route": route, "obs": obs, "model": name, **score(predict, test, seqs)})
+        for day in test:
+            day_rows.append({"route": route, "obs": obs, "model": name, "day": day,
+                             **score(predict, [day], seqs)})
+
+    res, by_day = pd.DataFrame(rows), pd.DataFrame(day_rows)
+    print(res.drop(columns=["route", "obs"]).to_string(index=False, float_format="%.4f"))
+
+    # per test day: the HMM next to the Markov chain, and on how many days the HMM was better
+    cols = ["loglik_per_interval"] + [f"brier_k{k}" for k in STEPS_AHEAD]
+    hmm_d = by_day[by_day["model"] == "hmm"].set_index("day")[cols]
+    markov_d = by_day[by_day["model"] == "markov"].set_index("day")[cols]
+    print("\nper test day (log-lik: higher is better, Brier: lower is better)")
+    print(pd.concat({"hmm": hmm_d, "markov": markov_d}, axis=1).to_string(float_format="%.4f"))
+    wins = [f"log-lik {(hmm_d['loglik_per_interval'] > markov_d['loglik_per_interval']).sum()}"]
+    for k in STEPS_AHEAD:
+        wins.append(f"Brier k={k} {(hmm_d[f'brier_k{k}'] < markov_d[f'brier_k{k}']).sum()}")
+    print(f"days (of {len(test)}) the HMM beat the Markov chain: " + ", ".join(wins))
     print()
-    return res
-
-
-def plot(res, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    routes = list(res["route"].unique())
-    fig, axes = plt.subplots(1, len(routes), figsize=(5 * len(routes), 4), squeeze=False)
-    styles = {"independent": ":", "markov": "--", "time_of_day": "-."}
-    for ax, route in zip(axes[0], routes):
-        r = res[res["route"] == route]
-        h = r[r["hidden_states"].notna()].sort_values("hidden_states")
-        if len(h):
-            ax.plot(h["hidden_states"], h["test_loglik"], "o-", color="black", label="HMM")
-            ax.set_xticks(h["hidden_states"].astype(int).unique())
-        for model, ls in styles.items():
-            row = r[r["model"] == model]
-            if len(row):
-                ax.axhline(row["test_loglik"].iloc[0], ls=ls, color="gray", label=model)
-        ax.set_xlabel("number of hidden states S")
-        ax.set_ylabel("test log-likelihood per interval")
-        ax.set_title(route)
-        ax.legend(frameon=False, fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    print(f"plot saved to {path}")
+    return res, by_day
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--route", nargs="+", default=ROUTES)
-    ap.add_argument("--obs", choices=OBSERVATIONS, default="level")
-    ap.add_argument("--test-days", type=int, default=4)
-    ap.add_argument("--hmm-dir", default="hmms", help="folder with the trained HMMs (.npz)")
+    ap.add_argument("--route", nargs="+", default=list(ROUTES.values()))
+    ap.add_argument("--obs", choices=list(OBSERVATIONS), default="level")
     args = ap.parse_args()
 
-    res = pd.concat([evaluate_route(r, args.obs, args.test_days, args.hmm_dir)
-                     for r in args.route])
+    results = [evaluate_route(r, args.obs) for r in args.route]
     RES_DIR.mkdir(exist_ok=True)
-    res.to_csv(RES_DIR / f"results_{args.obs}.csv", index=False)
-    print(f"results saved to {RES_DIR / f'results_{args.obs}.csv'}")
-    plot(res, RES_DIR / f"test_loglik_{args.obs}.png")
+    pd.concat([res for res, _ in results]).to_csv(RES_DIR / f"results_{args.obs}.csv", index=False)
+    pd.concat([by_day for _, by_day in results]).to_csv(RES_DIR / f"results_{args.obs}_by_day.csv", index=False)
+    print(f"results saved to {RES_DIR / f'results_{args.obs}.csv'} and results_{args.obs}_by_day.csv")
 
 
 if __name__ == "__main__":

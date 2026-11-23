@@ -118,7 +118,7 @@ def sort_states(pi, A, B):
     order = np.argsort(B @ np.arange(B.shape[1]))
     return pi[order], A[order][:, order], B[order]
 
-def baum_welch(days, K=3, M=4, restarts=10, pseudo=0.1, max_iters=500, tol=1e-6, seed=11):
+def baum_welch(days, K=3, M=3, restarts=10, pseudo=0.1, max_iters=500, tol=1e-6, seed=11):
     """Best of several EM runs from random starts. Returns pi, A, B (states sorted) and log P of the training days"""
     rng = np.random.default_rng(seed)
     best = None
@@ -169,7 +169,7 @@ def viterbi(pi, A, B, observations):
         for j in range(K):
             scores = log_delta[t - 1] + np.log(A[:, j])
             backpointers_m[t, j] = np.argmax(scores)
-            log_delta[t, j] = scores[back[t, j]] + e[j]
+            log_delta[t, j] = scores[backpointers_m[t, j]] + e[j]
 
     path = np.zeros(T, dtype=int)
     path[-1] = np.argmax(log_delta[-1])

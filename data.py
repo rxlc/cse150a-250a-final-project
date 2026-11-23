@@ -23,13 +23,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from config import OBSERVATIONS, TEST_DAYS
+
 DATA_DIR = Path(__file__).parent / "data"
 OUT_DIR = Path(__file__).parent / "output"
 ROUTES = {"UCSD_1040": "inside_loop", "UCSD_1030": "outside_loop", "UCSD_1050": "mesa_loop"}
 STEP_MS = 5 * 60 * 1000
 TZ = "America/Los_Angeles"
 
-EXCLUDE_DAYS = {"2026-11-01", "2026-11-11"} # daylight savings & Veterans day
+EXCLUDE_DAYS = {"2026-11-01", "2026-11-11", "2026-11-18"} # daylight savings & Veterans day & Nov 18
+# Nov 18: the OneBusAway feed reported 0 active buses on every route (UCSD and MTS) from about
+# 13:20 to 13:45, so that afternoon's long waits are missing data, not real delays
 
 def load(name):
     """Read data/<name>.csv with ids read as text so they keep leading zeros"""
@@ -243,6 +247,24 @@ def print_sequence(name, day, from_clock="00:00", n=12, obs_name="level"):
 
 def merge_0_1_levels(o):
     return np.where(o < 0, -1, np.maximum(o, 1) - 1)
+
+def load_route(name, obs_name="level"):
+    """For the HMM and baselines: {day: levels, -1 missing} and {day: start of step 0 in epoch ms}
+    for one observation. Levels 0 and 1 are merged if config.OBSERVATIONS says so (for "level":
+    0 normal or shorter, 1 longer, 2 much longer)."""
+    _, merge = OBSERVATIONS[obs_name]
+    seqs = load_sequences(name, obs_name)
+    if merge:
+        seqs = {day: merge_0_1_levels(o) for day, o in seqs.items()}
+    days = pd.read_csv(OUT_DIR / f"{name}_{obs_name}_days.csv")
+    starts = dict(zip(days["day"], days["start_ms"].astype("int64")))
+    return seqs, starts
+
+def split_days(days):
+    """(train days, test days): test on config.TEST_DAYS, train on the rest. The same for every model."""
+    days = sorted(days)
+    assert all(d in days for d in TEST_DAYS), "a test day is missing from the data"
+    return [d for d in days if d not in TEST_DAYS], list(TEST_DAYS)
 
 def main():
     stop_passages = load("stop_passages")
