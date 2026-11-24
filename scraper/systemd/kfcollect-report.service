@@ -1,0 +1,17 @@
+[Unit]
+Description=kfcollect: daily report
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=kfcollect
+Group=kfcollect
+Environment=KF_CONFIG=/etc/kfcollect/config.env
+WorkingDirectory=/opt/kfcollect
+ExecStart=/opt/kfcollect/venv/bin/python -m kfcollect report
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/kfcollect

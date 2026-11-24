@@ -1,0 +1,24 @@
+[Unit]
+Description=Killer Fish transit data collector (OneBusAway + GTFS)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kfcollect
+Group=kfcollect
+Environment=KF_CONFIG=/etc/kfcollect/config.env
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/kfcollect
+ExecStart=/opt/kfcollect/venv/bin/python -m kfcollect run
+Restart=always
+RestartSec=10
+# Hardening: read-only system, writable data dir only.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/kfcollect
+
+[Install]
+WantedBy=multi-user.target

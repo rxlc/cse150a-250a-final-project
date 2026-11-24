@@ -12,8 +12,16 @@ With k = 1 this is the usual one-step prediction used for the log-likelihood.
                                        closer to 0 = the model predicted the real data better
                                        (this is the main score)
     Brier score at k = 1, 2, 6         sum over levels of (predicted p - 1 if it happened else 0)^2,
-                                       for the prediction made k steps (5, 10, 30 min) earlier;
-                                       0 is perfect, lower is better
+    (brier_k<k>)                       for the prediction made k steps (5, 10, 30 min) earlier;
+                                       0 is perfect, lower is better. Scores the whole forecast
+    yes/no delay Brier at k = 1, 2, 6  (p - 1 if delayed else 0)^2, where p = predicted P(delayed),
+    (brier_delay_k<k>)                 "delayed" = level >= config.DELAYED_FROM[obs] (for excess
+                                       wait: longer or much longer). Scores only the number a rider
+                                       would see; it adds to the Brier score above, not replaces it
+    skill_<score>                      1 - score / unigram's score on the same days: the share of
+                                       the unigram's error the model removes (0 = no better than the
+                                       unigram, 1 = perfect, below 0 = worse). For log-likelihood the
+                                       "error" is -log-likelihood
 
 Accuracy is not reported: most intervals are "normal", so always guessing "normal" scores well.
 Scores of different observations (--obs) are not comparable with each other: compare each
@@ -46,8 +54,8 @@ import numpy as np
 import pandas as pd
 
 from baselines import fit_baselines
-from config import K, K_CANDIDATES, OBSERVATIONS, STEPS_AHEAD
-from data import OUT_DIR, ROUTES, load_route, split_days
+from config import DELAYED_FROM, K, K_CANDIDATES, OBSERVATIONS, STEPS_AHEAD
+from data import OUT_DIR, ROUTES, hmm_path, load_route, split_days
 from hmm import forecasts
 
 RES_DIR = OUT_DIR.parent / "results"
@@ -80,23 +88,51 @@ def brier(preds, levels, k):
     return total, n
 
 
-def score(predict, days, seqs):
+def delay_forecasts(preds, levels, k, delayed_from):
+    """The yes/no delay forecasts over the observed steps t >= k: a list of
+    (predicted P(level >= delayed_from), 1 if the level really was >= delayed_from else 0)."""
+    pairs = []
+    for t in range(k, len(levels)):
+        o = levels[t]
+        if o >= 0:
+            pairs.append((preds[t, delayed_from:].sum(), 1 if o >= delayed_from else 0))
+    return pairs
+
+
+def score(predict, days, seqs, delayed_from):
     """Score one model on a set of days. predict(day, levels, k) -> (T, M) array as above.
-    Returns log-likelihood per observed interval and the mean Brier score at each k."""
+    Returns log-likelihood per observed interval, and the mean Brier score and mean yes/no
+    delay Brier score at each k."""
     ll, n_ll = 0.0, 0
     br = {k: [0.0, 0] for k in STEPS_AHEAD}
+    pairs = {k: [] for k in STEPS_AHEAD}
     for day in days:
         levels = seqs[day]
         s, n = log_lik(predict(day, levels, 1), levels)
         ll, n_ll = ll + s, n_ll + n
         for k in STEPS_AHEAD:
-            s, n = brier(predict(day, levels, k), levels, k)
+            preds = predict(day, levels, k)
+            s, n = brier(preds, levels, k)
             br[k][0] += s
             br[k][1] += n
+            pairs[k] += delay_forecasts(preds, levels, k, delayed_from)
     result = {"loglik_per_interval": ll / n_ll, "n_intervals": n_ll}
     for k in STEPS_AHEAD:
         result[f"brier_k{k}"] = br[k][0] / br[k][1]
+    for k in STEPS_AHEAD:
+        result[f"brier_delay_k{k}"] = np.mean([(p - y) ** 2 for p, y in pairs[k]])
     return result
+
+
+def add_skill(table, group):
+    """Add skill_<score> = 1 - score / unigram's score, comparing rows that share `group`
+    (e.g. the same route, or the same route and day)."""
+    scores = [c for c in table.columns if c == "loglik_per_interval" or c.startswith("brier")]
+    ref = table[table["model"] == "independent"].set_index(group)[scores]
+    for c in scores:
+        unigram = table.set_index(group).index.map(ref[c])
+        table[f"skill_{c}"] = 1 - table[c].to_numpy() / unigram.to_numpy()
+    return table
 
 
 # ---------------------------------------------------------------- the HMM, as a predictor
@@ -113,10 +149,10 @@ def predict_hmm(pi, A, B, levels, k):
 
 
 def load_hmm(route, obs, n_states, train, test):
-    """predict(day, levels, k) for the HMM with n_states hidden states in
-    output/<route>_<obs>_K<n_states>_hmm.npz. Checks it was trained on the current training
-    days and not on the test days, so a stale file is not used."""
-    path = OUT_DIR / f"{route}_{obs}_K{n_states}_hmm.npz"
+    """predict(day, levels, k) for the HMM with n_states hidden states saved by hmm_train.py
+    (data.hmm_path). Checks it was trained on the current training days and not on the test
+    days, so a stale file is not used."""
+    path = hmm_path(route, obs, n_states)
     saved = np.load(path)
     if ("train_days" not in saved or list(saved["train_days"]) != list(train)
             or list(saved["test_days"]) != list(test)):
@@ -128,10 +164,12 @@ def load_hmm(route, obs, n_states, train, test):
 
 def evaluate_route(route, obs, all_states):
     M, _ = OBSERVATIONS[obs]
+    delayed_from = DELAYED_FROM[obs]
     seqs, starts = load_route(route, obs)
 
     train, test = split_days(seqs)
-    print(f"=== {route} ({obs}, M = {M}): train {len(train)} days, test {', '.join(test)}")
+    print(f"=== {route} ({obs}, M = {M}): train {len(train)} days ({train[0]}..{train[-1]}), "
+          f"test {', '.join(test)}")
 
     # 1. every model comes from the training days only
     predictors, _ = fit_baselines(train, seqs, starts, M)
@@ -141,25 +179,32 @@ def evaluate_route(route, obs, all_states):
     # 2. every model is scored the same way: on all test days together, and on each test day
     rows, day_rows = [], []
     for name, predict in predictors.items():
-        rows.append({"route": route, "obs": obs, "model": name, **score(predict, test, seqs)})
+        rows.append({"route": route, "obs": obs, "model": name,
+                     **score(predict, test, seqs, delayed_from)})
         for day in test:
             day_rows.append({"route": route, "obs": obs, "model": name, "day": day,
-                             **score(predict, [day], seqs)})
+                             **score(predict, [day], seqs, delayed_from)})
 
-    res, by_day = pd.DataFrame(rows), pd.DataFrame(day_rows)
-    print(res.drop(columns=["route", "obs"]).to_string(index=False, float_format="%.4f"))
+    res = add_skill(pd.DataFrame(rows), ["route"])
+    by_day = add_skill(pd.DataFrame(day_rows), ["route", "day"])
+
+    scores = ["loglik_per_interval"] + [f"brier_k{k}" for k in STEPS_AHEAD]
+    delay_scores = [f"brier_delay_k{k}" for k in STEPS_AHEAD]
+    shown = res.set_index("model")
+    print(shown[["n_intervals"] + scores].to_string(float_format="%.4f"))
+    print(f"\nyes/no delay forecast (delayed = level >= {delayed_from}): Brier, lower is better")
+    print(shown[delay_scores].to_string(float_format="%.4f"))
+    print("\nskill vs the unigram (share of its error removed; higher is better)")
+    print(shown[[f"skill_{c}" for c in scores + delay_scores]].to_string(float_format="%.3f"))
 
     # per test day: each HMM next to the Markov chain, and on how many days the HMM was better
-    cols = ["loglik_per_interval"] + [f"brier_k{k}" for k in STEPS_AHEAD]
-    markov_d = by_day[by_day["model"] == "markov"].set_index("day")[cols]
+    markov_d = by_day[by_day["model"] == "markov"].set_index("day")[scores + delay_scores]
     for n_states in all_states:
         name = f"hmm_K{n_states}"
-        hmm_d = by_day[by_day["model"] == name].set_index("day")[cols]
-        print(f"\nper test day, {name} vs markov (log-lik: higher is better, Brier: lower is better)")
-        print(pd.concat({name: hmm_d, "markov": markov_d}, axis=1).to_string(float_format="%.4f"))
+        hmm_d = by_day[by_day["model"] == name].set_index("day")[scores + delay_scores]
         wins = [f"log-lik {(hmm_d['loglik_per_interval'] > markov_d['loglik_per_interval']).sum()}"]
-        for k in STEPS_AHEAD:
-            wins.append(f"Brier k={k} {(hmm_d[f'brier_k{k}'] < markov_d[f'brier_k{k}']).sum()}")
+        for c in scores[1:] + delay_scores:
+            wins.append(f"{c} {(hmm_d[c] < markov_d[c]).sum()}")
         print(f"days (of {len(test)}) {name} beat the Markov chain: " + ", ".join(wins))
     print()
     return res, by_day
@@ -174,10 +219,11 @@ def main():
     all_states = K_CANDIDATES if args.k_ablation else [K]
 
     results = [evaluate_route(r, args.obs, all_states) for r in args.route]
+    names = [f"results_{args.obs}.csv", f"results_{args.obs}_by_day.csv"]
     RES_DIR.mkdir(exist_ok=True)
-    pd.concat([res for res, _ in results]).to_csv(RES_DIR / f"results_{args.obs}.csv", index=False)
-    pd.concat([by_day for _, by_day in results]).to_csv(RES_DIR / f"results_{args.obs}_by_day.csv", index=False)
-    print(f"results saved to {RES_DIR / f'results_{args.obs}.csv'} and results_{args.obs}_by_day.csv")
+    for i, file in enumerate(names):
+        pd.concat([r[i] for r in results]).to_csv(RES_DIR / file, index=False)
+    print(f"results saved in {RES_DIR}: " + ", ".join(names))
 
 
 if __name__ == "__main__":

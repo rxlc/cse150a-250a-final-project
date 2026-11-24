@@ -1,0 +1,10 @@
+[Unit]
+Description=kfcollect: daily report
+
+[Timer]
+OnCalendar=*-*-* 22:15:00 America/Los_Angeles
+Persistent=true
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

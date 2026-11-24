@@ -251,12 +251,14 @@ def merge_0_1_levels(o):
 def load_route(name, obs_name="level"):
     """For the HMM and baselines: {day: levels, -1 missing} and {day: start of step 0 in epoch ms}
     for one observation. Levels 0 and 1 are merged if config.OBSERVATIONS says so (for "level":
-    0 normal or shorter, 1 longer, 2 much longer)."""
+    0 normal or shorter, 1 longer, 2 much longer). "level4" reads the same excess-wait files
+    without merging (the 4-level model of Section 4.2)."""
     _, merge = OBSERVATIONS[obs_name]
-    seqs = load_sequences(name, obs_name)
+    source = "level" if obs_name == "level4" else obs_name
+    seqs = load_sequences(name, source)
     if merge:
         seqs = {day: merge_0_1_levels(o) for day, o in seqs.items()}
-    days = pd.read_csv(OUT_DIR / f"{name}_{obs_name}_days.csv")
+    days = pd.read_csv(OUT_DIR / f"{name}_{source}_days.csv")
     starts = dict(zip(days["day"], days["start_ms"].astype("int64")))
     return seqs, starts
 
@@ -265,6 +267,10 @@ def split_days(days):
     days = sorted(days)
     assert all(d in days for d in TEST_DAYS), "a test day is missing from the data"
     return [d for d in days if d not in TEST_DAYS], list(TEST_DAYS)
+
+def hmm_path(name, obs_name, n_states):
+    """Where hmm_train.py saves an HMM and evaluate.py loads it: output/<route>_<obs>_K<n_states>_hmm.npz."""
+    return OUT_DIR / f"{name}_{obs_name}_K{n_states}_hmm.npz"
 
 def main():
     stop_passages = load("stop_passages")

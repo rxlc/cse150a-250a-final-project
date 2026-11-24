@@ -1,0 +1,10 @@
+[Unit]
+Description=kfcollect: derive stop passages, segments and 5-minute intervals
+
+[Timer]
+OnCalendar=*:07
+Persistent=true
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

@@ -35,6 +35,7 @@ LEVELS = {
     "level": ["normal_or_shorter", "longer", "much_longer"],
     "ratio": ["short", "regular", "long", "very_long"],
     "delay": ["early", "on_time", "late", "very_late"],
+    "level4": ["shorter", "normal", "longer", "much_longer"],
 }
 
 

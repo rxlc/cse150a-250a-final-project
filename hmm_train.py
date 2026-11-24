@@ -1,5 +1,6 @@
 """Fit one HMM per route for one observation, on the training days only (all days except
-config.TEST_DAYS), and save it in output/<route>_<obs>_K<number of states>_hmm.npz:
+config.TEST_DAYS), and save it in output/<route>_<obs>_K<number of states>_hmm.npz
+(see data.hmm_path):
 
     pi, A, B, log_p        the HMM, trained on the training days
     train_days, test_days  the days it was trained on, and the test days it never saw;
@@ -20,7 +21,7 @@ import argparse
 import numpy as np
 
 from config import K, K_CANDIDATES, OBSERVATIONS, PSEUDO, SEED
-from data import OUT_DIR, ROUTES, load_route, split_days
+from data import ROUTES, hmm_path, load_route, split_days
 from hmm import baum_welch
 
 np.set_printoptions(precision=3, suppress=True)
@@ -41,9 +42,10 @@ def main():
         n_steps = sum(len(o) for o in days)
 
         for n_states in all_states:
-            print(f"{name} ({args.obs}, M = {M}, K = {n_states}): train {len(train)} days, test {', '.join(test)}")
+            print(f"{name} ({args.obs}, M = {M}, K = {n_states}): train {len(train)} days "
+                  f"({train[0]}..{train[-1]}), test {', '.join(test)}")
             pi, A, B, log_p = baum_welch(days, K=n_states, M=M, pseudo=PSEUDO, seed=SEED)
-            np.savez(OUT_DIR / f"{name}_{args.obs}_K{n_states}_hmm.npz", pi=pi, A=A, B=B, log_p=log_p,
+            np.savez(hmm_path(name, args.obs, n_states), pi=pi, A=A, B=B, log_p=log_p,
                      train_days=np.array(train), test_days=np.array(test))
 
             print(f" best log P = {log_p:.2f}  ({log_p / n_steps:.3f} per step)")

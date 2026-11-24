@@ -11,4 +11,9 @@ OBSERVATIONS = {
     "level": (3, True),
     "ratio": (4, False),
     "delay": (4, False),
+    "level4": (4, False),  # excess wait without merging levels 0 and 1 (learns the timetable, Section 4.2)
 }
+
+# yes/no delay forecast: "delayed" means level >= DELAYED_FROM[obs]
+# (level: longer or much longer; ratio: long or very long gap; delay: late or very late)
+DELAYED_FROM = {"level": 1, "ratio": 2, "delay": 2, "level4": 2}
